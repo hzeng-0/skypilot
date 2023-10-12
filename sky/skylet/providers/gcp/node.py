@@ -49,10 +49,19 @@ MAX_POLLS = 12
 # considerably - this probably could be smaller
 # TPU deletion uses MAX_POLLS
 MAX_POLLS_TPU = MAX_POLLS * 8
+
+# We can wait forever for queued resource
+MAX_POLLS_QUEUED = 100000
+MAX_POLLS_FOREVER = 1000000000000
+
 # Stopping instances can take several minutes, so we increase the timeout
 MAX_POLLS_STOP = MAX_POLLS * 8
 POLL_INTERVAL = 5
 
+#
+def hz_log(explain, content):
+    print(explain + ":", content, "\n;;;;;;;\n", file=open("/home/zeng/SKYLOG", "a"))
+#
 
 def _retry_on_exception(
     exception: Union[Exception, Tuple[Exception]],
@@ -96,14 +105,18 @@ def _generate_node_name(labels: dict, node_suffix: str) -> str:
     This is required so that the correct resource can be selected
     when the only information autoscaler has is the name of the node.
 
-    The suffix is expected to be one of 'compute' or 'tpu'
+    The suffix is expected to be one of 'compute' or 'tpu' or 'queued'
     (as in ``GCPNodeType``).
     """
     name_label = labels[TAG_RAY_NODE_NAME]
+    hz_log("labels, node.py L107", labels)
+    hz_log("name_label, node.py L108", name_label)
     assert len(name_label) <= (INSTANCE_NAME_MAX_LEN - INSTANCE_NAME_UUID_LEN - 1), (
         name_label,
         len(name_label),
     )
+    hz_log("_generate_node_name output, node.py L113",
+           f"{name_label}-{uuid4().hex[:INSTANCE_NAME_UUID_LEN]}-{node_suffix}")
     return f"{name_label}-{uuid4().hex[:INSTANCE_NAME_UUID_LEN]}-{node_suffix}"
 
 
@@ -112,10 +125,14 @@ class GCPNodeType(Enum):
 
     COMPUTE = "compute"
     TPU = "tpu"
+    QUEUED = 'queued'
 
     @staticmethod
     def from_gcp_node(node: "GCPNode"):
         """Return GCPNodeType based on ``node``'s class"""
+        if isinstance(node, GCPQueuedNode):
+            # do this check first because of inheritance
+            return GCPNodeType.QUEUED
         if isinstance(node, GCPTPUNode):
             return GCPNodeType.TPU
         if isinstance(node, GCPComputeNode):
@@ -127,13 +144,14 @@ class GCPNodeType(Enum):
         """Provided a node name, determine the type.
 
         This expects the name to be in format '[NAME]-[UUID]-[TYPE]',
-        where [TYPE] is either 'compute' or 'tpu'.
+        where [TYPE] is either 'compute' or 'tpu' or 'queued'.
         """
+        # should correspond to _generate_node_name? #todo(hz)
         return GCPNodeType(name.split("-")[-1])
 
 
 class GCPNode(UserDict, metaclass=abc.ABCMeta):
-    """Abstraction around compute and tpu nodes"""
+    """Abstraction around compute and tpu nodes"""#todo(hz)
 
     NON_TERMINATED_STATUSES = None
     RUNNING_STATUSES = None
@@ -182,6 +200,7 @@ class GCPComputeNode(GCPNode):
     """Abstraction around compute nodes"""
 
     # https://cloud.google.com/compute/docs/instances/instance-life-cycle
+    # https://cloud.google.com/compute/docs/reference/rest/v1/instances? #todo(hz)
     NON_TERMINATED_STATUSES = {"PROVISIONING", "STAGING", "RUNNING"}
     RUNNING_STATUSES = {"RUNNING"}
     STOPPED_STATUSES = {"TERMINATED"}
@@ -230,6 +249,12 @@ class GCPTPUNode(GCPNode):
     def get_internal_ip(self) -> str:
         return self.get("networkEndpoints", [{}])[0].get("ipAddress", None)
 
+#
+class GCPQueuedNode(GCPTPUNode):
+    """Abstraction around queued resource nodes."""
+    # should we also store some kind of self.queued_request?
+    # or should we fetch it each time, using self.get("queuedResource", [])
+#
 
 class GCPResource(metaclass=abc.ABCMeta):
     """Abstraction around compute and TPU resources"""
@@ -718,6 +743,7 @@ class GCPTPU(GCPResource):
         return instances
 
     def get_instance(self, node_id: str) -> GCPTPUNode:
+        hz_log("node_id for TPU, node.py L744", node_id)
         instance = (
             self.resource.projects().locations().nodes().get(name=node_id).execute()
         )
@@ -757,6 +783,7 @@ class GCPTPU(GCPResource):
     def create_instance(
         self, base_config: dict, labels: dict, wait_for_operation: bool = True
     ) -> Tuple[dict, str]:
+        hz_log("node.py L783", "TPU create instance")
         config = base_config.copy()
         # removing Compute-specific default key set in config.py
         config.pop("networkInterfaces", None)
@@ -835,6 +862,210 @@ class GCPTPU(GCPResource):
         # No need to increase MAX_POLLS for deletion
         if wait_for_operation:
             result = self.wait_for_operation(operation, max_polls=MAX_POLLS)
+        else:
+            result = operation
+
+        return result
+
+
+##
+
+
+
+class GCPQueued(GCPTPU):
+    """Abstraction around GCP Queued resource (blah blah)"""
+
+    def _generate_request_name(self, name: str) -> str:
+        return name + "-request"
+
+    def list_instances(self, label_filters: Optional[dict] = None) -> List[GCPQueuedNode]:
+        non_terminated_status = list(GCPQueuedNode.NON_TERMINATED_STATUSES)
+        return self._list_instances(label_filters, non_terminated_status)
+
+    # def _list_instances_no_filter(self) -> List[GCPQueuedNode]:
+
+    def _delete_queued_resource(self, queued_resource):
+        operation = (
+            self.resource.projects().locations().queuedResources().delete(
+                name=queued_resource['name']
+            ).execute()
+        )
+        result = self.wait_for_operation(operation, max_polls=MAX_POLLS_FOREVER)
+
+    def _list_instances(
+        self, label_filters: Optional[dict], status_filter: Optional[List[str]]
+    ) -> List[GCPQueuedNode]:
+        try:
+            response = (
+                self.resource.projects()
+                .locations()
+                .queuedResources()
+                .list(parent=self.path)
+                .execute()
+            )
+        except HttpError as e:
+            # SKY: Catch HttpError when accessing unauthorized region.
+            # Return empty list instead of raising exception to not break
+            # ray down.
+            logger.warning(f"googleapiclient.errors.HttpError: {e.reason}")
+            return []
+
+        queued_resources = response.get("queuedResources", [])
+
+        hz_log("listing queued resources, node.py L905", queued_resources)
+        # if queued resource is suspended, delete? or ignore (hz)
+        for q in queued_resources:
+            if q['state']['state'] == 'SUSPENDED':
+                self._delete_queued_resource(q)
+
+        instances = [self.get_instance(q['tpu']['nodeSpec'][0]['nodeId'])
+                     for q in queued_resources if q['state']['state'] != 'SUSPENDED']
+        hz_log("queued resource instances, node.py L905", instances)
+
+        # filter_expr cannot be passed directly to API
+        # so we need to filter the results ourselves
+
+        # same logic as in GCPCompute.list_instances
+        label_filters = label_filters or {}
+        label_filters[TAG_RAY_CLUSTER_NAME] = self.cluster_name
+
+        def filter_instance(instance: GCPQueuedNode) -> bool:
+
+            labels = instance.get_labels()
+            if label_filters:
+                for key, value in label_filters.items():
+                    if key not in labels:
+                        return False
+                    if value != labels[key]:
+                        return False
+
+            if status_filter:
+                if instance.get_status() not in status_filter:
+                    return False
+
+            return True
+
+        instances = list(filter(filter_instance, instances))
+        hz_log("finished list, node.py L905", "")
+
+        return instances
+
+    def get_instance(self, node_id: str) -> GCPQueuedNode:
+        instance = (
+            self.resource.projects().locations().nodes().get(
+                name=self.path + "/nodes/" + node_id
+            ).execute()
+        )
+
+        return GCPQueuedNode(instance, self)
+
+    def create_instance(
+        self, base_config: dict, labels: dict, wait_for_operation: bool = True
+    ) -> Tuple[dict, str]:
+        hz_log("node.py L944", "QUEUED create instance")
+        config = base_config.copy()
+        # removing Compute-specific default key set in config.py
+        config.pop("networkInterfaces", None)
+        node_name = _generate_node_name(labels, GCPNodeType.QUEUED.value)
+        queued_resource_name = self._generate_request_name(node_name)
+
+        labels = dict(config.get("labels", {}), **labels)
+
+        config.update(
+            {
+                "labels": dict(labels, **{TAG_RAY_CLUSTER_NAME: self.cluster_name}),
+            }
+        )
+
+        if "networkConfig" not in config:
+            config["networkConfig"] = {}
+        if "enableExternalIps" not in config["networkConfig"]:
+            # this is required for SSH to work, per google documentation
+            # https://cloud.google.com/tpu/docs/users-guide-tpu-vm#create-curl
+            config["networkConfig"]["enableExternalIps"] = True
+
+        config.pop('schedulingConfig')
+
+        queued_resource_config = {
+            'queueingPolicy' : {},
+            'tpu' : {
+                'nodeSpec' : {
+                    'parent' : self.path, # todo(hz) is this needed?
+                    'nodeId' : node_name,
+                    'node' : config,
+                },
+            },
+            'bestEffort' : {},
+        }
+
+        hz_log("self.path", self.path)
+        hz_log("queued_resource_config", queued_resource_config)
+        hz_log("queued_resource_name", queued_resource_name)
+        
+
+        try:
+            operation = (
+                self.resource.projects()
+                .locations()
+                .queuedResources()
+                .create(
+                    parent=self.path,
+                    body=queued_resource_config,
+                    queuedResourceId=queued_resource_name,
+                )
+                .execute()
+            )
+        except HttpError as e:
+            # SKY: Catch HttpError when accessing unauthorized region.
+            logger.error(f"googleapiclient.errors.HttpError: {e.reason}")
+            raise e
+
+        if wait_for_operation:
+            result = self.wait_for_operation(operation, max_polls=MAX_POLLS_QUEUED)
+        else:
+            result = operation
+
+        # wait for VM to come up
+        while True:
+            current = self.resource.projects().locations().queuedResources().get(
+                name=f'projects/{self.project_id}/locations/{self.availability_zone}/queuedResources/{queued_resource_name}',
+            ).execute()
+            if current['state']['state'] == 'ACTIVE':
+                break
+            elif current['state']['state'] in ['FAILED', 'SUSPENDED', 'SUSPENDING', 'DELETING']:
+                # do some failure stuff
+                hz_log("rip", "lol")
+
+        hz_log("Finished creating Queued Resource", "")
+
+        return result, node_name
+
+    def start_instance(self, node_id: str, wait_for_operation: bool = True) -> dict:
+        raise Exception("Shouldn't try to stop/start queued resources")
+
+
+    def stop_instance(self, node_id: str, wait_for_operation: bool = True) -> dict:
+        raise Exception("Shouldn't try to stop/start queued resources")
+
+    def delete_instance(self, node_id: str, wait_for_operation: bool = True) -> dict:
+        # delete queued resource or delete TPU?
+        # if latter, don't need to write anything
+        # assume former
+
+        hz_log("deleting queued resource, node.py L1027")
+        tpu = self.get_instance(node_id) # not gonna work (hz)
+        if 'queuedResource' not in tpu:
+            raise Exception("NodeId doesn't correspond to node for Queued Resource.")
+
+        operation = (
+            self.resource.projects().locations().nodes().delete(
+                name=tpu['queuedResource']
+            ).execute()
+        )
+
+        # No need to increase MAX_POLLS for deletion
+        if wait_for_operation:
+            result = self.wait_for_operation(operation, max_polls=MAX_POLLS_QUEUED)
         else:
             result = operation
 

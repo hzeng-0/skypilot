@@ -67,9 +67,15 @@ TPU_SERVICE_ACCOUNT_ROLES = ["roles/tpu.admin"]
 # to True in config["provider"].
 HAS_TPU_PROVIDER_FIELD = "_has_tpus"
 
+HAS_QUEUED_RESOURCE_PROVIDER_FIELD = "_has_queued_resource"
+
 # NOTE: iam.serviceAccountUser allows the Head Node to create worker nodes
 # with ServiceAccounts.
 
+#
+def hz_log(explain, content):
+    print(explain + ":", content, "\n;;;;;;;\n", file=open("/home/zeng/SKYLOG", "a"))
+#
 
 def get_node_type(node: dict) -> GCPNodeType:
     """Returns node type based on the keys in ``node``.
@@ -77,10 +83,11 @@ def get_node_type(node: dict) -> GCPNodeType:
     This is a very simple check. If we have a ``machineType`` key,
     this is a Compute instance. If we don't have a ``machineType`` key,
     but we have ``acceleratorType``, this is a TPU. Otherwise, it's
-    invalid and an exception is raised.
+    invalid and an exception is raised. #todo(hz)
 
     This works for both node configs and API returned nodes.
     """
+    hz_log("node, config.py L88", node)
 
     if "machineType" not in node and "acceleratorType" not in node:
         raise ValueError(
@@ -92,6 +99,13 @@ def get_node_type(node: dict) -> GCPNodeType:
         )
 
     if "machineType" not in node and "acceleratorType" in node:
+        # check if queued resource
+        if 'schedulingConfig' in node and 'preemptible' in node['schedulingConfig']:
+            if node['schedulingConfig']['preemptible'] == True:
+                if node['acceleratorType'][:2] == 'v4':
+                    hz_log("DOPE2", node)
+                    return GCPNodeType.QUEUED
+        hz_log("HEH?", node)
         return GCPNodeType.TPU
     return GCPNodeType.COMPUTE
 
@@ -190,14 +204,24 @@ def _has_tpus_in_node_configs(config: dict) -> bool:
     ]
     return any(get_node_type(node) == GCPNodeType.TPU for node in node_configs)
 
+# has queued resource
+def _has_queued_resource_in_node_configs(config: dict) -> bool:
+    """Check if any nodes in config are queued resources."""
+    node_configs = [
+        node_type["node_config"]
+        for node_type in config["available_node_types"].values()
+    ]
+    return any(get_node_type(node) == GCPNodeType.QUEUED for node in node_configs)
+#
 
 def _is_head_node_a_tpu(config: dict) -> bool:
-    """Check if the head node is a TPU."""
+    """Check if the head node is a TPU.""" #todo(hz)
     node_configs = {
         node_id: node_type["node_config"]
         for node_id, node_type in config["available_node_types"].items()
     }
-    return get_node_type(node_configs[config["head_node_type"]]) == GCPNodeType.TPU
+    return get_node_type(node_configs[config["head_node_type"]]) in (
+        GCPNodeType.TPU, GCPNodeType.QUEUED)
 
 
 def _create_crm(gcp_credentials=None):
@@ -227,6 +251,10 @@ def _create_tpu(gcp_credentials=None):
         discoveryServiceUrl="https://tpu.googleapis.com/$discovery/rest",
     )
 
+#
+# create queued TPU#todo(hz)
+# def _create_queued(gcp_credentials=None):
+#
 
 def construct_clients_from_provider_config(provider_config):
     """
@@ -248,9 +276,15 @@ def construct_clients_from_provider_config(provider_config):
             if provider_config.get(HAS_TPU_PROVIDER_FIELD, False)
             else None
         )
+        queued_resource = (
+            _create_tpu() # currently the same resource as tpu_resource
+            if provider_config.get(HAS_QUEUED_RESOURCE_PROVIDER_FIELD, False)
+            else None
+        )
         # If gcp_credentials is None, then discovery.build will search for
         # credentials in the local environment.
-        return _create_crm(), _create_iam(), _create_compute(), tpu_resource
+        return (_create_crm(), _create_iam(), _create_compute(), tpu_resource,
+                queued_resource)
 
     assert (
         "type" in gcp_credentials
@@ -284,16 +318,23 @@ def construct_clients_from_provider_config(provider_config):
         if provider_config.get(HAS_TPU_PROVIDER_FIELD, False)
         else None
     )
+    queued_resource = (
+        _create_tpu(credentials) # currently the same
+        if provider_config.get(HAS_QUEUED_RESOURCE_PROVIDER_FIELD, False)
+        else None
+    )
 
     return (
         _create_crm(credentials),
         _create_iam(credentials),
         _create_compute(credentials),
         tpu_resource,
+        queued_resource
     )
 
 
 def bootstrap_gcp(config):
+    # hz_log("config, config.py L305", config)
     config = copy.deepcopy(config)
     check_legacy_fields(config)
     # Used internally to store head IAM role.
@@ -304,12 +345,17 @@ def bootstrap_gcp(config):
     if _has_tpus_in_node_configs(config):
         config["provider"][HAS_TPU_PROVIDER_FIELD] = True
 
-    crm, iam, compute, tpu = construct_clients_from_provider_config(config["provider"])
+    if _has_queued_resource_in_node_configs(config):
+        config["provider"][HAS_QUEUED_RESOURCE_PROVIDER_FIELD] = True
+
+    crm, iam, compute, tpu, _ = construct_clients_from_provider_config(config["provider"])
 
     config = _configure_project(config, crm)
     config = _configure_iam_role(config, crm, iam)
     config = _configure_key_pair(config, compute)
     config = _configure_subnet(config, compute)
+
+    # hz_log("config, config.py L323", config)
 
     return config
 
@@ -758,7 +804,7 @@ def get_usable_vpc(config):
 
     If not found, create a new one with sufficient firewall rules.
     """
-    _, _, compute, _ = construct_clients_from_provider_config(config["provider"])
+    _, _, compute, _, _ = construct_clients_from_provider_config(config["provider"])
 
     # For backward compatibility, reuse the VPC if the VM is launched.
     resource = GCPCompute(
@@ -870,6 +916,7 @@ def _configure_subnet(config, compute):
 
     for node_config in node_configs:
         # The not applicable key will be removed during node creation
+        hz_log("node_config, config.py L881", node_config)
 
         # compute
         if "networkInterfaces" not in node_config:
@@ -886,7 +933,8 @@ def _configure_subnet(config, compute):
             # the created VM.
             node_config["tags"]["items"].append(config["cluster_name"])
         else:
-            assert get_node_type(node_config) == GCPNodeType.TPU, node_config
+            assert get_node_type(node_config) in (GCPNodeType.TPU,
+                                                  GCPNodeType.QUEUED), node_config
             # TPU VM has a different api for tags. See
             # https://cloud.google.com/tpu/docs/reference/rest/v2alpha1/projects.locations.nodes  # pylint: disable=line-too-long
             if "tags" not in node_config:

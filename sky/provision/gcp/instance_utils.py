@@ -17,6 +17,8 @@ def instance_to_handler(instance: str):
         return GCPComputeInstance
     elif instance_type == 'tpu':
         return GCPTPUVMInstance
+    elif instance_type = 'queued':
+        return GCPQueuedInstance
     else:
         raise ValueError(f'Unknown instance type: {instance_type}')
 

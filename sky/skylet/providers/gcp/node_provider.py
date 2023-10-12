@@ -33,6 +33,7 @@ from sky.skylet.providers.gcp.node import (  # noqa
     GCPNodeType,
     GCPResource,
     GCPTPU,
+    GCPQueued,
     # Added by SkyPilot
     INSTANCE_NAME_MAX_LEN,
     INSTANCE_NAME_UUID_LEN,
@@ -43,6 +44,10 @@ from ray.autoscaler.node_provider import NodeProvider
 
 logger = logging.getLogger(__name__)
 
+#
+def hz_log(explain, content):
+    print(explain + ":", content, "\n;;;;;;;\n", file=open("/home/zeng/SKYLOG", "a"))
+#
 
 def _retry(method, max_tries=5, backoff_s=1):
     """Retry decorator for methods of GCPNodeProvider.
@@ -82,9 +87,10 @@ class GCPNodeProvider(NodeProvider):
         # excessive DescribeInstances requests.
         self.cached_nodes: Dict[str, GCPNode] = {}
         self.cache_stopped_nodes = provider_config.get("cache_stopped_nodes", True)
+        hz_log("ayoayo"," ayoayo")
 
     def _construct_clients(self):
-        _, _, compute, tpu = construct_clients_from_provider_config(
+        _, _, compute, tpu, queued_resource = construct_clients_from_provider_config(
             self.provider_config
         )
 
@@ -100,10 +106,21 @@ class GCPNodeProvider(NodeProvider):
             self.cluster_name,
         )
 
-        # if there are no TPU nodes defined in config, tpu will be None.
+        # if there are no TPU nodes defined in config, tpu will be None. #todo(hz)
         if tpu is not None:
+            hz_log("wow", "there is tpu")
             self.resources[GCPNodeType.TPU] = GCPTPU(
                 tpu,
+                self.provider_config["project_id"],
+                self.provider_config["availability_zone"],
+                self.cluster_name,
+            )
+
+        # similar for queued resource
+        if queued_resource is not None:
+            hz_log("wow", "there is qr")
+            self.resources[GCPNodeType.QUEUED] = GCPQueued(
+                queued_resource,
                 self.provider_config["project_id"],
                 self.provider_config["availability_zone"],
                 self.cluster_name,
@@ -113,24 +130,27 @@ class GCPNodeProvider(NodeProvider):
         """Return the resource responsible for the node, based on node_name.
 
         This expects the name to be in format '[NAME]-[UUID]-[TYPE]',
-        where [TYPE] is either 'compute' or 'tpu' (see ``GCPNodeType``).
+        where [TYPE] is either 'compute' or 'tpu' (see ``GCPNodeType``).#todo(hz)
         """
+        hz_log("type is", GCPNodeType.name_to_type(node_name))
         return self.resources[GCPNodeType.name_to_type(node_name)]
 
     @_retry
     def non_terminated_nodes(self, tag_filters: dict):
+        hz_log("111", "hi")
         with self.lock:
             instances = []
 
             for resource in self.resources.values():
                 node_instances = resource.list_instances(tag_filters)
                 instances += node_instances
-
+            hz_log("yoooooooooooo", "hi")
             # Note: All the operations use "name" as the unique instance id
             self.cached_nodes = {i["name"]: i for i in instances}
             return [i["name"] for i in instances]
 
     def is_running(self, node_id: str):
+        hz_log("222", "hi")
         with self.lock:
             node = self._get_cached_node(node_id)
             return node.is_running()
@@ -186,16 +206,19 @@ class GCPNodeProvider(NodeProvider):
         Returns dict mapping instance id to each create operation result for the created
         instances.
         """
+        hz_log("333", "hi")
         with self.lock:
             result_dict = {}
             labels = tags  # gcp uses "labels" instead of aws "tags"
             labels = dict(sorted(copy.deepcopy(labels).items()))
 
             node_type = get_node_type(base_config)
+            hz_log("node_type, node_provider.py L211:", node_type)
             resource = self.resources[node_type]
 
             # Try to reuse previously stopped nodes with compatible configs
             if self.cache_stopped_nodes:
+                hz_log("444", "no")
                 filters = {
                     TAG_RAY_NODE_KIND: labels[TAG_RAY_NODE_KIND],
                     # SkyPilot: removed TAG_RAY_LAUNCH_CONFIG to allow reusing nodes
@@ -217,7 +240,7 @@ class GCPNodeProvider(NodeProvider):
                     STOPPED_STATUS = ["TERMINATED", "STOPPING"]
                 else:
                     STOPPED_STATUS = ["STOPPED", "STOPPING"]
-
+                hz_log("555", "no")
                 # SkyPilot: We try to use the instances with the same matching launch_config first. If
                 # there is not enough instances with matching launch_config, we then use all the
                 # instances with the same matching launch_config plus some instances with wrong
@@ -285,6 +308,7 @@ class GCPNodeProvider(NodeProvider):
                         self.set_node_tags(node_id, tags)
                     count -= len(reuse_node_ids)
             if count:
+                hz_log("node_provider.py L306", "")
                 results = resource.create_instances(base_config, labels, count)
                 result_dict.update(
                     {instance_id: result for result, instance_id in results}
@@ -348,12 +372,15 @@ class GCPNodeProvider(NodeProvider):
     @_retry
     def _get_node(self, node_id: str) -> GCPNode:
         self.non_terminated_nodes({})  # Side effect: updates cache
+        hz_log("999", "999")
 
         with self.lock:
             if node_id in self.cached_nodes:
                 return self.cached_nodes[node_id]
 
+            hz_log("888", "888")
             resource = self._get_resource_depending_on_node_name(node_id)
+            hz_log("777", "777")
             instance = resource.get_instance(node_id=node_id)
 
             return instance

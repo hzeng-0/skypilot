@@ -1,0 +1,34 @@
+Notes (do not commit)
+=====================
+
+how it works:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+in node_provider.py
+
+1. Extend GCPTPU and GCPTPUNode by GCPQueuedTPU and GCPQueuedTPUNode
+
+
+
+
+questions:
+
+- about schedulingConfig
+- about whether to implement as extension class
+- python question
+
+
+catch on higher level start/stop
