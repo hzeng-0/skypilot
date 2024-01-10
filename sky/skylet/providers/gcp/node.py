@@ -895,6 +895,7 @@ class GCPQueued(GCPTPU):
     def _list_instances(
         self, label_filters: Optional[dict], status_filter: Optional[List[str]]
     ) -> List[GCPQueuedNode]:
+        hz_log("list instances [label_filters, status_filter]", [label_filters, status_filter])
         try:
             response = (
                 self.resource.projects()
@@ -1030,11 +1031,13 @@ class GCPQueued(GCPTPU):
             current = self.resource.projects().locations().queuedResources().get(
                 name=f'projects/{self.project_id}/locations/{self.availability_zone}/queuedResources/{queued_resource_name}',
             ).execute()
+            hz_log("CREATE:", current['state']['state'])
             if current['state']['state'] == 'ACTIVE':
                 break
             elif current['state']['state'] in ['FAILED', 'SUSPENDED', 'SUSPENDING', 'DELETING']:
                 # do some failure stuff
                 hz_log("rip", "lol")
+            time.sleep(3)
 
         hz_log("Finished creating Queued Resource", "")
 

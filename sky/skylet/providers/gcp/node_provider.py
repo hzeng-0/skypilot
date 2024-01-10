@@ -87,7 +87,8 @@ class GCPNodeProvider(NodeProvider):
         # excessive DescribeInstances requests.
         self.cached_nodes: Dict[str, GCPNode] = {}
         self.cache_stopped_nodes = provider_config.get("cache_stopped_nodes", True)
-        hz_log("ayoayo"," ayoayo")
+        hz_log("node provider provider config", provider_config)
+        hz_log("node provider cluster name", cluster_name)
 
     def _construct_clients(self):
         _, _, compute, tpu, queued_resource = construct_clients_from_provider_config(
@@ -137,16 +138,20 @@ class GCPNodeProvider(NodeProvider):
 
     @_retry
     def non_terminated_nodes(self, tag_filters: dict):
-        hz_log("111", "hi")
+        hz_log("111", tag_filters)
         with self.lock:
             instances = []
 
             for resource in self.resources.values():
+                hz_log("non-terminated, resource", resource)
                 node_instances = resource.list_instances(tag_filters)
+                hz_log("non-terminated, node instances", node_instances)
                 instances += node_instances
-            hz_log("yoooooooooooo", "hi")
+                hz_log("non-terminated step instances", instances)
             # Note: All the operations use "name" as the unique instance id
             self.cached_nodes = {i["name"]: i for i in instances}
+            hz_log("non-terminated full instances", instances)
+            hz_log("non-terminated", [i["name"] for i in instances])
             return [i["name"] for i in instances]
 
     def is_running(self, node_id: str):

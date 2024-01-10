@@ -334,7 +334,7 @@ def construct_clients_from_provider_config(provider_config):
 
 
 def bootstrap_gcp(config):
-    # hz_log("config, config.py L305", config)
+    hz_log("config, config.py L305", config)
     config = copy.deepcopy(config)
     check_legacy_fields(config)
     # Used internally to store head IAM role.

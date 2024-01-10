@@ -17,8 +17,9 @@ def instance_to_handler(instance: str):
         return GCPComputeInstance
     elif instance_type == 'tpu':
         return GCPTPUVMInstance
-    elif instance_type = 'queued':
-        return GCPQueuedInstance
+    elif instance_type == 'queued':
+        # ?
+        return GCPTPUVMInstance
     else:
         raise ValueError(f'Unknown instance type: {instance_type}')
 
@@ -210,6 +211,115 @@ class GCPComputeInstance(GCPInstance):
             project=project_id,
             firewall=firewall_rule_name,
         ).execute()
+
+
+class GCPTPUVMInstance(GCPInstance):
+    """Instance handler for GCP TPU node."""
+    NEED_TO_STOP_STATES = [
+        'CREATING',
+        'STARTING',
+        'READY',
+        'RESTARTING',
+    ]
+
+    NON_STOPPED_STATES = NEED_TO_STOP_STATES + ['STOPPING']
+
+    @classmethod
+    def load_resource(cls):
+        return gcp.build(
+            'tpu',
+            TPU_VERSION,
+            credentials=None,
+            cache_discovery=False,
+            discoveryServiceUrl='https://tpu.googleapis.com/$discovery/rest')
+
+    @classmethod
+    def wait_for_operation(cls, operation: dict, project_id: str,
+                           zone: str) -> bool:
+        """Poll for TPU operation until finished."""
+        del project_id, zone  # unused
+        result = (cls.load_resource().projects().locations().operations().get(
+            name=str(operation['name'])).execute())
+        if 'error' in result:
+            raise Exception(result['error'])
+
+        if 'response' in result:
+            logger.debug('wait_for_tpu_operation: '
+                         f'Operation {operation["name"]} finished.')
+            return True
+        return False
+
+    @classmethod
+    def filter(
+        cls,
+        project_id: str,
+        zone: str,
+        label_filters: Optional[Dict[str, str]],
+        status_filters: Optional[List[str]],
+        included_instances: Optional[List[str]] = None,
+        excluded_instances: Optional[List[str]] = None,
+    ) -> List[str]:
+        path = f'projects/{project_id}/locations/{zone}'
+        try:
+            response = (cls.load_resource().projects().locations().nodes().list(
+                parent=path).execute())
+        except gcp.http_error_exception() as e:
+            # SKY: Catch HttpError when accessing unauthorized region.
+            # Return empty list instead of raising exception to not break
+            # ray down.
+            logger.warning(f'googleapiclient.errors.HttpError: {e.reason}')
+            return []
+
+        instances = response.get('nodes', [])
+
+        # filter_expr cannot be passed directly to API
+        # so we need to filter the results ourselves
+
+        # same logic as in GCPCompute.list_instances
+        label_filters = label_filters or {}
+
+        def filter_instance(instance) -> bool:
+            labels = instance.get('labels', {})
+            if label_filters:
+                for key, value in label_filters.items():
+                    if key not in labels:
+                        return False
+                    if value != labels[key]:
+                        return False
+
+            if status_filters:
+                if instance.get('state') not in status_filters:
+                    return False
+
+            return True
+
+        instances = list(filter(filter_instance, instances))
+        instances = [i['name'] for i in instances]
+
+        if included_instances:
+            instances = [i for i in instances if i in included_instances]
+        if excluded_instances:
+            instances = [i for i in instances if i not in excluded_instances]
+
+        return instances
+
+    @classmethod
+    def stop(cls, project_id: str, zone: str, instance: str) -> dict:
+        """Stop a TPU node."""
+        del project_id, zone  # unused
+        operation = cls.load_resource().projects().locations().nodes().stop(
+            name=instance).execute()
+        return operation
+
+    @classmethod
+    def terminate(cls, project_id: str, zone: str, instance: str) -> dict:
+        """Terminate a TPU node."""
+        del project_id, zone  # unused
+        operation = cls.load_resource().projects().locations().nodes().delete(
+            name=instance).execute()
+        return operation
+
+
 
 
 class GCPTPUVMInstance(GCPInstance):
